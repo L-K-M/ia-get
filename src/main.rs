@@ -13,7 +13,6 @@ use ia_get::downloader;
 use ia_get::utils::{create_spinner, sanitize_filename, validate_archive_url};
 use ia_get::{IaGetError, Result};
 use indicatif::ProgressStyle;
-use reqwest::header::{HeaderMap, HeaderValue, COOKIE, SET_COOKIE};
 use reqwest::{Client, StatusCode};
 use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
@@ -59,21 +58,14 @@ struct LoginRequest<'a> {
 }
 
 /// Builds the HTTP client used for metadata and file downloads
-fn build_http_client(session_cookie: Option<&str>) -> Result<Client> {
-    let mut builder = Client::builder()
+fn build_http_client() -> Result<Client> {
+    let builder = Client::builder()
         .user_agent(USER_AGENT)
+        .cookie_store(true)
         .connect_timeout(std::time::Duration::from_secs(CONNECTION_TIMEOUT_SECS))
         .pool_idle_timeout(std::time::Duration::from_secs(90))
         .pool_max_idle_per_host(1)
         .tcp_keepalive(std::time::Duration::from_secs(60));
-
-    if let Some(cookie) = session_cookie {
-        let mut headers = HeaderMap::new();
-        let cookie_value = HeaderValue::from_str(cookie)
-            .map_err(|e| IaGetError::Network(format!("Invalid auth cookie value: {}", e)))?;
-        headers.insert(COOKIE, cookie_value);
-        builder = builder.default_headers(headers);
-    }
 
     Ok(builder.build()?)
 }
@@ -117,6 +109,11 @@ fn get_xml_url(original_url: &str) -> String {
 
     // The XML URL is "{download_url_base}/{identifier}_files.xml"
     format!("{}/{}_files.xml", download_url_base, identifier)
+}
+
+/// Encodes path characters that break strict URL parsing on archive redirects
+fn encode_archive_path_for_url(path: &str) -> String {
+    path.replace('[', "%5B").replace(']', "%5D")
 }
 
 /// Fetches and parses XML metadata from archive.org
@@ -263,31 +260,12 @@ fn describe_login_error(status: StatusCode, response: &LoginResponse) -> String 
     format!("Authentication failed (HTTP {}): {}", status, reason)
 }
 
-/// Converts Set-Cookie headers into a single Cookie request header string
-fn extract_cookie_header(headers: &HeaderMap) -> Option<String> {
-    let cookie_pairs = headers
-        .get_all(SET_COOKIE)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .filter_map(|set_cookie| set_cookie.split(';').next())
-        .map(str::trim)
-        .filter(|cookie| !cookie.is_empty())
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
-
-    if cookie_pairs.is_empty() {
-        None
-    } else {
-        Some(cookie_pairs.join("; "))
-    }
-}
-
-/// Authenticates with archive.org and returns a session cookie header value
+/// Authenticates with archive.org and stores session cookies in the shared client
 async fn authenticate_archive_org(
     client: &Client,
     username: &str,
     password: &str,
-) -> Result<String> {
+) -> Result<()> {
     let token_response = client
         .get(LOGIN_API_URL)
         .timeout(std::time::Duration::from_secs(60))
@@ -324,17 +302,11 @@ async fn authenticate_archive_org(
         .send()
         .await?;
 
-    let session_cookie = extract_cookie_header(login_response.headers());
     let status = login_response.status();
     let login_payload: LoginResponse = login_response.json().await?;
 
     if status.is_success() && login_payload.success {
-        return session_cookie.ok_or_else(|| {
-            IaGetError::Network(
-                "Authentication succeeded but archive.org did not return session cookies."
-                    .to_string(),
-            )
-        });
+        return Ok(());
     }
 
     Err(IaGetError::Network(describe_login_error(status, &login_payload)))
@@ -350,6 +322,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let auth_credentials = resolve_auth_credentials(&cli)?;
     let is_authenticated = auth_credentials.is_some();
+    let client = build_http_client()?;
 
     // Start a single spinner for the entire initialization process
     let spinner = create_spinner(&format!("Processing archive.org URL: {}", cli.url.bold()));
@@ -360,10 +333,6 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         return Err(e.into());
     }
 
-    // Create an unauthenticated client for optional login and fallback downloads
-    let bootstrap_client = build_http_client(None)?;
-    let mut session_cookie = None;
-
     // Authenticate if credentials were provided
     if let Some((username, password)) = auth_credentials.as_ref() {
         spinner.set_message(format!(
@@ -372,26 +341,15 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             username.bold()
         ));
 
-        let cookie = match authenticate_archive_org(&bootstrap_client, username, password).await {
-            Ok(cookie) => cookie,
-            Err(e) => {
-                spinner.finish_with_message(format!(
-                    "{} Authentication failed for {}",
-                    "✘".red().bold(),
-                    username.bold()
-                ));
-                return Err(e.into());
-            }
-        };
-
-        session_cookie = Some(cookie);
+        if let Err(e) = authenticate_archive_org(&client, username, password).await {
+            spinner.finish_with_message(format!(
+                "{} Authentication failed for {}",
+                "✘".red().bold(),
+                username.bold()
+            ));
+            return Err(e.into());
+        }
     }
-
-    let client = if let Some(cookie) = session_cookie.as_deref() {
-        build_http_client(Some(cookie))?
-    } else {
-        bootstrap_client
-    };
 
     // Check URL accessibility
     if let Err(e) = is_url_accessible(&cli.url, &client).await {
@@ -425,7 +383,8 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         }
 
         let mut absolute_url = base_url.clone();
-        if let Ok(joined_url) = absolute_url.join(&file.name) {
+        let encoded_remote_path = encode_archive_path_for_url(&file.name);
+        if let Ok(joined_url) = absolute_url.join(&encoded_remote_path) {
             absolute_url = joined_url;
         }
 
@@ -570,6 +529,16 @@ mod tests {
     }
 
     #[test]
+    fn encode_archive_path_for_url_encodes_square_brackets() {
+        let path = "DATs/Bandai - WonderSwan Color [T-En] Collection (06-10-2022).zip";
+        let encoded = encode_archive_path_for_url(path);
+        assert_eq!(
+            encoded,
+            "DATs/Bandai - WonderSwan Color %5BT-En%5D Collection (06-10-2022).zip"
+        );
+    }
+
+    #[test]
     fn trim_trailing_newlines_only() {
         assert_eq!(trim_trailing_newlines("secret\n".to_string()), "secret");
         assert_eq!(trim_trailing_newlines("secret\r\n".to_string()), "secret");
@@ -657,22 +626,4 @@ mod tests {
         assert!(description.contains("Email address and/or password incorrect"));
     }
 
-    #[test]
-    fn extract_cookie_header_joins_multiple_cookies() {
-        let mut headers = HeaderMap::new();
-        headers.append(
-            SET_COOKIE,
-            HeaderValue::from_static("logged-in-user=user123; Path=/; Secure"),
-        );
-        headers.append(
-            SET_COOKIE,
-            HeaderValue::from_static("logged-in-sig=sig456; Path=/; Secure"),
-        );
-
-        let cookie_header = extract_cookie_header(&headers);
-        assert_eq!(
-            cookie_header,
-            Some("logged-in-user=user123; logged-in-sig=sig456".to_string())
-        );
-    }
 }
