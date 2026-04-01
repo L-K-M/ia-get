@@ -39,6 +39,7 @@ pub struct XmlFile {
     pub btih: Option<String>,
     pub summation: Option<String>,
     pub original: Option<String>,
+    pub private: Option<String>,
 }
 
 /// Parses XML content into XmlFiles structure with improved error context
@@ -68,4 +69,32 @@ pub fn parse_xml_files(xml_content: &str) -> Result<XmlFiles> {
             }
         ))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_private_file_metadata() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<files>
+  <file name="private.bin" source="original">
+    <md5>0123456789abcdef0123456789abcdef</md5>
+    <private>true</private>
+  </file>
+  <file name="public.bin" source="original">
+    <md5>fedcba9876543210fedcba9876543210</md5>
+  </file>
+</files>"#;
+
+        let parsed = parse_xml_files(xml).expect("XML should parse successfully");
+        assert_eq!(parsed.files.len(), 2);
+
+        assert_eq!(parsed.files[0].name, "private.bin");
+        assert_eq!(parsed.files[0].private.as_deref(), Some("true"));
+
+        assert_eq!(parsed.files[1].name, "public.bin");
+        assert_eq!(parsed.files[1].private, None);
+    }
 }

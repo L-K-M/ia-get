@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use colored::*;
 use reqwest::header::{HeaderMap, HeaderValue};
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 
 use crate::error::IaGetError; // Import IaGetError for explicit error conversion
 use crate::utils::{create_progress_bar, format_duration, format_size, format_transfer_rate};
@@ -236,6 +236,27 @@ async fn download_file_content(
                 continue; // Retry from the top of the loop
             }
         };
+
+        let status = response.status();
+        if !status.is_success() {
+            let mut message = format!("HTTP {} when downloading {}", status, url);
+
+            if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+                message.push_str(". File may be private or restricted on archive.org.");
+            } else if status == StatusCode::NOT_FOUND {
+                message.push_str(". File was not found in this archive item.");
+            }
+
+            println!(
+                "{} {}      {} {}",
+                "├╼".cyan().dimmed(),
+                "Failed".red().bold(),
+                "✘".red().bold(),
+                message
+            );
+
+            return Err(IaGetError::Network(message));
+        }
 
         let content_length = response.content_length().unwrap_or(0);
         let total_expected_size = if current_file_size > 0 {
