@@ -26,6 +26,26 @@ const MAX_RETRIES: u32 = 3;
 /// Initial delay between retries in milliseconds (doubles with each retry)
 const INITIAL_RETRY_DELAY_MS: u64 = 1000;
 
+/// Returns true if an HTTP status is likely transient and worth retrying
+fn is_retryable_http_status(status: StatusCode) -> bool {
+    status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS || status == StatusCode::REQUEST_TIMEOUT
+}
+
+/// Computes retry delay in milliseconds, honoring Retry-After when available
+fn retry_delay_ms(status: StatusCode, headers: &HeaderMap, retry_count: u32) -> u64 {
+    if status == StatusCode::TOO_MANY_REQUESTS || status == StatusCode::SERVICE_UNAVAILABLE {
+        if let Some(retry_after_secs) = headers
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<u64>().ok())
+        {
+            return retry_after_secs.saturating_mul(1000);
+        }
+    }
+
+    INITIAL_RETRY_DELAY_MS * 2u64.pow(retry_count - 1)
+}
+
 /// Sets up signal handling for graceful shutdown on Ctrl+C
 ///
 /// Returns an Arc<AtomicBool> that can be checked to see if the process
@@ -239,12 +259,45 @@ async fn download_file_content(
 
         let status = response.status();
         if !status.is_success() {
+            if is_retryable_http_status(status) {
+                retry_count += 1;
+
+                if retry_count <= MAX_RETRIES {
+                    let delay = retry_delay_ms(status, response.headers(), retry_count);
+                    println!(
+                        "{} {}      {} HTTP {} (attempt {}/{})",
+                        "├╼".cyan().dimmed(),
+                        "Retry".yellow().bold(),
+                        "⟳".yellow().bold(),
+                        status,
+                        retry_count,
+                        MAX_RETRIES
+                    );
+                    println!(
+                        "{} {}      Waiting {:.1}s before retry...",
+                        "├╼".cyan().dimmed(),
+                        "Wait".white(),
+                        delay as f64 / 1000.0
+                    );
+
+                    tokio::time::sleep(tokio::time::Duration::from_millis(delay)).await;
+
+                    file.flush()?;
+                    file.seek(SeekFrom::End(0))?;
+                    continue;
+                }
+            }
+
             let mut message = format!("HTTP {} when downloading {}", status, url);
 
             if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
                 message.push_str(". File may be private or restricted on archive.org.");
             } else if status == StatusCode::NOT_FOUND {
                 message.push_str(". File was not found in this archive item.");
+            } else if status.is_server_error() {
+                message.push_str(
+                    ". Archive.org returned a server error after retries. This is usually temporary; rerun to resume.",
+                );
             }
 
             println!(
