@@ -259,6 +259,65 @@ async fn download_file_content(
 
         let status = response.status();
         if !status.is_success() {
+            // Handle 416 Range Not Satisfiable: usually means the local partial
+            // file is already at or beyond the remote file size (e.g., the
+            // remote file shrank, or a previous run already completed the
+            // transfer but didn't get a chance to verify).
+            if status == StatusCode::RANGE_NOT_SATISFIABLE && current_file_size > 0 {
+                // Try to parse total size from Content-Range: "bytes */TOTAL"
+                let remote_total = response
+                    .headers()
+                    .get(reqwest::header::CONTENT_RANGE)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.rsplit('/').next())
+                    .and_then(|total| total.trim().parse::<u64>().ok());
+
+                match remote_total {
+                    Some(total) if current_file_size == total => {
+                        // Local file already matches remote size; treat as complete.
+                        println!(
+                            "{} {}   {} {} (already complete)",
+                            "├╼".cyan().dimmed(),
+                            "Downloaded".white(),
+                            "↓".green().bold(),
+                            format_size(current_file_size).bold(),
+                        );
+                        return Ok(current_file_size);
+                    }
+                    Some(total) if current_file_size > total => {
+                        // Local file is larger than remote; truncate and retry
+                        // from scratch so the subsequent request fetches the
+                        // full current remote file.
+                        println!(
+                            "{} {}      {} Local file larger than remote ({} > {}); restarting",
+                            "├╼".cyan().dimmed(),
+                            "Reset".yellow().bold(),
+                            "⟳".yellow().bold(),
+                            format_size(current_file_size),
+                            format_size(total),
+                        );
+                        file.set_len(0)?;
+                        file.seek(SeekFrom::Start(0))?;
+                        file.flush()?;
+                        continue;
+                    }
+                    _ => {
+                        // No Content-Range header or ambiguous; best effort:
+                        // truncate and retry full download once.
+                        println!(
+                            "{} {}      {} HTTP 416 with ambiguous range; restarting from scratch",
+                            "├╼".cyan().dimmed(),
+                            "Reset".yellow().bold(),
+                            "⟳".yellow().bold(),
+                        );
+                        file.set_len(0)?;
+                        file.seek(SeekFrom::Start(0))?;
+                        file.flush()?;
+                        continue;
+                    }
+                }
+            }
+
             if is_retryable_http_status(status) {
                 retry_count += 1;
 
