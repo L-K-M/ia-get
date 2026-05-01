@@ -111,9 +111,38 @@ fn get_xml_url(original_url: &str) -> String {
     format!("{}/{}_files.xml", download_url_base, identifier)
 }
 
-/// Encodes path characters that break strict URL parsing on archive redirects
+/// Percent-encodes archive metadata paths for use as URL paths.
+///
+/// Archive.org metadata gives us literal file paths, not URL-encoded paths. Keep
+/// `/` as a directory separator, but encode each path segment so characters like
+/// `%`, spaces, `?`, `#`, brackets, and parentheses cannot be interpreted as URL
+/// syntax.
 fn encode_archive_path_for_url(path: &str) -> String {
-    path.replace('[', "%5B").replace(']', "%5D")
+    path.split('/')
+        .map(encode_archive_path_segment)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn encode_archive_path_segment(segment: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+    let mut encoded = String::with_capacity(segment.len());
+
+    for byte in segment.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => {
+                encoded.push('%');
+                encoded.push(HEX[(byte >> 4) as usize] as char);
+                encoded.push(HEX[(byte & 0x0F) as usize] as char);
+            }
+        }
+    }
+
+    encoded
 }
 
 /// Fetches and parses XML metadata from archive.org
@@ -382,11 +411,8 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
-        let mut absolute_url = base_url.clone();
         let encoded_remote_path = encode_archive_path_for_url(&file.name);
-        if let Ok(joined_url) = absolute_url.join(&encoded_remote_path) {
-            absolute_url = joined_url;
-        }
+        let absolute_url = base_url.join(&encoded_remote_path)?;
 
         // Sanitize filename for filesystem compatibility
         let (sanitized_name, was_modified) = sanitize_filename(&file.name);
@@ -529,12 +555,39 @@ mod tests {
     }
 
     #[test]
-    fn encode_archive_path_for_url_encodes_square_brackets() {
+    fn encode_archive_path_for_url_encodes_each_path_segment() {
         let path = "DATs/Bandai - WonderSwan Color [T-En] Collection (06-10-2022).zip";
         let encoded = encode_archive_path_for_url(path);
         assert_eq!(
             encoded,
-            "DATs/Bandai - WonderSwan Color %5BT-En%5D Collection (06-10-2022).zip"
+            "DATs/Bandai%20-%20WonderSwan%20Color%20%5BT-En%5D%20Collection%20%2806-10-2022%29.zip"
+        );
+    }
+
+    #[test]
+    fn encode_archive_path_for_url_encodes_literal_percent() {
+        let path = "100% Pascal Sensei - Kanpeki Paint Bombers (Japan).7z";
+        let encoded = encode_archive_path_for_url(path);
+
+        assert_eq!(
+            encoded,
+            "100%25%20Pascal%20Sensei%20-%20Kanpeki%20Paint%20Bombers%20%28Japan%29.7z"
+        );
+    }
+
+    #[test]
+    fn encoded_archive_path_joins_to_expected_download_url() {
+        let base_url = reqwest::Url::parse(
+            "https://archive.org/download/3ds-main-encrypted/3ds-main-encrypted_files.xml",
+        )
+        .expect("base URL should parse");
+        let encoded =
+            encode_archive_path_for_url("100% Pascal Sensei - Kanpeki Paint Bombers (Japan).7z");
+        let download_url = base_url.join(&encoded).expect("encoded path should join");
+
+        assert_eq!(
+            download_url.as_str(),
+            "https://archive.org/download/3ds-main-encrypted/100%25%20Pascal%20Sensei%20-%20Kanpeki%20Paint%20Bombers%20%28Japan%29.7z"
         );
     }
 
