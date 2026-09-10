@@ -28,7 +28,9 @@ const INITIAL_RETRY_DELAY_MS: u64 = 1000;
 
 /// Returns true if an HTTP status is likely transient and worth retrying
 fn is_retryable_http_status(status: StatusCode) -> bool {
-    status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS || status == StatusCode::REQUEST_TIMEOUT
+    status.is_server_error()
+        || status == StatusCode::TOO_MANY_REQUESTS
+        || status == StatusCode::REQUEST_TIMEOUT
 }
 
 /// Computes retry delay in milliseconds, honoring Retry-After when available

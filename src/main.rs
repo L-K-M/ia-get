@@ -13,55 +13,101 @@ use ia_get::downloader;
 use ia_get::utils::{create_spinner, sanitize_filename, validate_archive_url};
 use ia_get::{IaGetError, Result};
 use indicatif::ProgressStyle;
-use reqwest::{Client, StatusCode};
-use serde::de::IgnoredAny;
-use serde::{Deserialize, Serialize};
+use reqwest::{cookie::Jar, Client, StatusCode};
+use serde::Deserialize;
+use std::sync::Arc;
 
 /// Extended timeout for large file downloads (10 minutes for connection, no read timeout)
 const CONNECTION_TIMEOUT_SECS: u64 = 600;
 
-/// Archive.org login endpoint for CSRF token and credential authentication
-const LOGIN_API_URL: &str = "https://archive.org/services/account/login/";
+/// Archive.org XAuthn login endpoint (form-encoded email + password).
+/// Same flow as the official internetarchive client; answers with the
+/// session cookies in the JSON body.
+const XAUTHN_LOGIN_API_URL: &str = "https://archive.org/services/xauthn/?op=login";
+
+/// Session cookie identifying the account, authorises restricted downloads
+const LOGGED_IN_USER_COOKIE: &str = "logged-in-user";
+/// Session cookie signing the account name
+const LOGGED_IN_SIG_COOKIE: &str = "logged-in-sig";
+
+/// Archive.org takes a moment to honour fresh session cookies across its
+/// download cluster; the internetarchive client waits for the same reason.
+const AUTH_PROPAGATION_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[derive(Deserialize)]
-struct LoginTokenResponse {
+struct XAuthnResponse {
     success: bool,
-    value: Option<LoginTokenValue>,
+    #[serde(default)]
+    values: Option<XAuthnValues>,
+    #[serde(default)]
     error: Option<String>,
 }
 
 #[derive(Deserialize)]
-struct LoginTokenValue {
-    token: String,
+struct XAuthnValues {
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    cookies: Option<XAuthnCookies>,
 }
 
 #[derive(Deserialize)]
-#[serde(untagged)]
-enum LoginResponseValue {
-    Status(String),
-    Other(IgnoredAny),
+struct XAuthnCookies {
+    #[serde(rename = "logged-in-user", default)]
+    logged_in_user: Option<String>,
+    #[serde(rename = "logged-in-sig", default)]
+    logged_in_sig: Option<String>,
 }
 
-#[derive(Deserialize)]
-struct LoginResponse {
-    success: bool,
-    value: Option<LoginResponseValue>,
-    error: Option<String>,
+/// Session cookies authorising downloads of restricted archive.org items
+#[derive(Debug)]
+struct LoginSession {
+    logged_in_user: String,
+    logged_in_sig: String,
 }
 
-#[derive(Serialize)]
-struct LoginRequest<'a> {
-    username: &'a str,
-    password: &'a str,
-    remember: &'a str,
-    t: &'a str,
+impl LoginSession {
+    /// Cookie strings valid for archive.org and its download subdomains
+    fn cookie_strings(&self) -> Vec<String> {
+        vec![
+            session_cookie(LOGGED_IN_USER_COOKIE, &self.logged_in_user),
+            session_cookie(LOGGED_IN_SIG_COOKIE, &self.logged_in_sig),
+        ]
+    }
+}
+
+/// Formats a session cookie so it is sent to archive.org and its
+/// download subdomains (e.g. ia123456.us.archive.org)
+fn session_cookie(name: &str, value: &str) -> String {
+    format!("{name}={value}; Domain=.archive.org; Path=/; Secure")
+}
+
+/// Extracts the download session cookies from a successful XAuthn response
+fn parse_login_session(response: &XAuthnResponse) -> Result<LoginSession> {
+    response
+        .values
+        .as_ref()
+        .and_then(|values| values.cookies.as_ref())
+        .and_then(
+            |cookies| match (&cookies.logged_in_user, &cookies.logged_in_sig) {
+                (Some(user), Some(sig)) => Some(LoginSession {
+                    logged_in_user: user.clone(),
+                    logged_in_sig: sig.clone(),
+                }),
+                _ => None,
+            },
+        )
+        .ok_or_else(|| IaGetError::Network("Login response missing session cookies".to_string()))
 }
 
 /// Builds the HTTP client used for metadata and file downloads
-fn build_http_client() -> Result<Client> {
+///
+/// The cookie jar is owned by the caller so authenticated session cookies
+/// can be added to it after login.
+fn build_http_client(cookie_jar: Arc<Jar>) -> Result<Client> {
     let builder = Client::builder()
         .user_agent(USER_AGENT)
-        .cookie_store(true)
+        .cookie_provider(cookie_jar)
         .connect_timeout(std::time::Duration::from_secs(CONNECTION_TIMEOUT_SECS))
         .pool_idle_timeout(std::time::Duration::from_secs(90))
         .pool_max_idle_per_host(1)
@@ -210,7 +256,7 @@ struct Cli {
     /// URL to an archive.org details page
     url: String,
 
-    /// Archive.org username or email for authenticated downloads
+    /// Archive.org account email address for authenticated downloads
     #[arg(long)]
     username: Option<String>,
 
@@ -265,80 +311,65 @@ fn resolve_auth_credentials(cli: &Cli) -> Result<Option<(String, String)>> {
     Ok(Some((username.clone(), password)))
 }
 
-/// Builds a descriptive authentication error from archive.org login API responses
-fn describe_login_error(status: StatusCode, response: &LoginResponse) -> String {
-    let reason = match response.value.as_ref() {
-        Some(LoginResponseValue::Status(value)) => match value.as_str() {
-            "bad_login" => "Email address and/or password incorrect".to_string(),
-            "account_not_verified" => {
-                "Account email address is not verified. Check your inbox for verification instructions."
-                    .to_string()
-            }
-            "account_max_unverified" => {
-                "Too many verification emails have been sent. Contact info@archive.org for assistance."
-                    .to_string()
-            }
+/// Builds a descriptive authentication error from archive.org XAuthn responses
+fn describe_xauthn_failure(status: StatusCode, response: &XAuthnResponse) -> String {
+    let reason = response
+        .values
+        .as_ref()
+        .and_then(|values| values.reason.as_deref())
+        .map(|reason| match reason {
+            "account_not_found" => "Account not found, check your email and try again.".to_string(),
+            "account_bad_password" => "Incorrect password, try again.".to_string(),
             other => other.to_string(),
-        },
-        _ => response
-            .error
-            .clone()
-            .unwrap_or_else(|| "Unknown authentication error".to_string()),
-    };
+        })
+        .or_else(|| response.error.clone())
+        .unwrap_or_else(|| "Unknown authentication error".to_string());
 
-    format!("Authentication failed (HTTP {}): {}", status, reason)
+    format!("Authentication failed (HTTP {status}): {reason}")
 }
 
-/// Authenticates with archive.org and stores session cookies in the shared client
+/// Authenticates with archive.org and stores session cookies in the shared cookie jar
+///
+/// Archive.org retired the login API that served CSRF tokens (it now answers
+/// 405), so the XAuthn endpoint is used instead. Unlike a browser login it
+/// returns the session cookies in the JSON body, hence the manual insertion
+/// into the cookie jar.
 async fn authenticate_archive_org(
     client: &Client,
+    cookie_jar: &Jar,
     username: &str,
     password: &str,
 ) -> Result<()> {
-    let token_response = client
-        .get(LOGIN_API_URL)
-        .timeout(std::time::Duration::from_secs(60))
-        .send()
-        .await?
-        .error_for_status()?;
-
-    let token_payload: LoginTokenResponse = token_response.json().await?;
-    if !token_payload.success {
-        return Err(IaGetError::Network(format!(
-            "Failed to obtain login token: {}",
-            token_payload
-                .error
-                .unwrap_or_else(|| "Unknown token response error".to_string())
-        )));
-    }
-
-    let csrf_token = token_payload
-        .value
-        .map(|value| value.token)
-        .ok_or_else(|| IaGetError::Network("Login token missing from response".to_string()))?;
-
-    let login_request = LoginRequest {
-        username,
-        password,
-        remember: "false",
-        t: &csrf_token,
-    };
-
     let login_response = client
-        .post(LOGIN_API_URL)
+        .post(XAUTHN_LOGIN_API_URL)
         .timeout(std::time::Duration::from_secs(60))
-        .json(&login_request)
+        .form(&[("email", username), ("password", password)])
         .send()
         .await?;
 
     let status = login_response.status();
-    let login_payload: LoginResponse = login_response.json().await?;
+    let payload: XAuthnResponse = login_response.json().await.map_err(|e| {
+        IaGetError::Network(format!("Unexpected login response (HTTP {status}): {e}"))
+    })?;
 
-    if status.is_success() && login_payload.success {
-        return Ok(());
+    if !payload.success {
+        return Err(IaGetError::Network(describe_xauthn_failure(
+            status, &payload,
+        )));
     }
 
-    Err(IaGetError::Network(describe_login_error(status, &login_payload)))
+    let session = parse_login_session(&payload)?;
+    let archive_org_url = reqwest::Url::parse("https://archive.org/")?;
+
+    for cookie in session.cookie_strings() {
+        cookie_jar.add_cookie_str(&cookie, &archive_org_url);
+    }
+
+    // Give archive.org time to propagate the fresh session across its
+    // download cluster before the first restricted request.
+    tokio::time::sleep(AUTH_PROPAGATION_DELAY).await;
+
+    Ok(())
 }
 
 /// Main application entry point
@@ -351,7 +382,8 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let auth_credentials = resolve_auth_credentials(&cli)?;
     let is_authenticated = auth_credentials.is_some();
-    let client = build_http_client()?;
+    let cookie_jar = Arc::new(Jar::default());
+    let client = build_http_client(cookie_jar.clone())?;
 
     // Start a single spinner for the entire initialization process
     let spinner = create_spinner(&format!("Processing archive.org URL: {}", cli.url.bold()));
@@ -370,7 +402,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             username.bold()
         ));
 
-        if let Err(e) = authenticate_archive_org(&client, username, password).await {
+        if let Err(e) = authenticate_archive_org(&client, &cookie_jar, username, password).await {
             spinner.finish_with_message(format!(
                 "{} Authentication failed for {}",
                 "✘".red().bold(),
@@ -443,7 +475,10 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             "{} No downloadable files found in metadata",
             "✘".red().bold()
         ));
-        return Err(IaGetError::Network("No downloadable files found in archive metadata.".to_string()).into());
+        return Err(IaGetError::Network(
+            "No downloadable files found in archive metadata.".to_string(),
+        )
+        .into());
     }
 
     // Successfully finished initialization
@@ -509,6 +544,21 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reqwest::cookie::CookieStore;
+
+    /// Sample success response of the XAuthn login endpoint
+    const XAUTHN_SUCCESS_JSON: &str = r#"{
+        "success": true,
+        "version": 1,
+        "values": {
+            "screenname": "someuser",
+            "s3": {"access": "abc", "secret": "xyz"},
+            "cookies": {
+                "logged-in-user": "user%40example.com",
+                "logged-in-sig": "s1gn4tur3"
+            }
+        }
+    }"#;
     use ia_get::utils::validate_archive_url;
 
     #[test]
@@ -621,7 +671,9 @@ mod tests {
         };
 
         let error = resolve_auth_credentials(&cli).expect_err("Missing password should fail");
-        assert!(error.to_string().contains("Authentication requires --password"));
+        assert!(error
+            .to_string()
+            .contains("Authentication requires --password"));
     }
 
     #[test]
@@ -667,16 +719,92 @@ mod tests {
     }
 
     #[test]
-    fn describe_login_error_for_bad_login() {
-        let response = LoginResponse {
-            success: false,
-            value: Some(LoginResponseValue::Status("bad_login".to_string())),
-            error: Some("Email address and/or Password incorrect".to_string()),
-        };
+    fn xauthn_success_payload_yields_session_cookies() {
+        let payload: XAuthnResponse =
+            serde_json::from_str(XAUTHN_SUCCESS_JSON).expect("Sample XAuthn payload should parse");
 
-        let description = describe_login_error(StatusCode::BAD_REQUEST, &response);
-        assert!(description.contains("HTTP 400"));
-        assert!(description.contains("Email address and/or password incorrect"));
+        let session = parse_login_session(&payload).expect("Session cookies should be extracted");
+        assert_eq!(session.logged_in_user, "user%40example.com");
+        assert_eq!(session.logged_in_sig, "s1gn4tur3");
+
+        for cookie in session.cookie_strings() {
+            assert!(cookie.contains("logged-in-user=") || cookie.contains("logged-in-sig="));
+            assert!(cookie.contains("Domain=.archive.org"));
+            assert!(cookie.contains("Path=/"));
+            assert!(cookie.contains("Secure"));
+        }
     }
 
+    #[test]
+    fn xauthn_failure_reason_maps_to_actionable_message() {
+        let payload: XAuthnResponse = serde_json::from_str(
+            r#"{"success":false,"values":{"reason":"account_bad_password"},"version":1}"#,
+        )
+        .expect("Failure payload should parse");
+
+        let description = describe_xauthn_failure(StatusCode::UNAUTHORIZED, &payload);
+        assert!(description.contains("HTTP 401"));
+        assert!(description.contains("Incorrect password"));
+    }
+
+    #[test]
+    fn xauthn_unknown_failure_reason_is_shown_verbatim() {
+        let payload: XAuthnResponse = serde_json::from_str(
+            r#"{"success":false,"values":{"reason":"server_on_fire"},"version":1}"#,
+        )
+        .expect("Failure payload should parse");
+
+        let description = describe_xauthn_failure(StatusCode::UNAUTHORIZED, &payload);
+        assert!(description.contains("server_on_fire"));
+    }
+
+    #[test]
+    fn xauthn_failure_without_reason_falls_back_to_error_field() {
+        let payload: XAuthnResponse =
+            serde_json::from_str(r#"{"success":false,"error":"bad request","version":1}"#)
+                .expect("Failure payload should parse");
+
+        let description = describe_xauthn_failure(StatusCode::BAD_REQUEST, &payload);
+        assert!(description.contains("bad request"));
+    }
+
+    #[test]
+    fn session_cookies_are_sent_to_archive_org_and_download_subdomains() {
+        let session = LoginSession {
+            logged_in_user: "user%40example.com".to_string(),
+            logged_in_sig: "s1gn4tur3".to_string(),
+        };
+        let jar = Jar::default();
+        let archive_org = reqwest::Url::parse("https://archive.org/").unwrap();
+
+        for cookie in session.cookie_strings() {
+            jar.add_cookie_str(&cookie, &archive_org);
+        }
+
+        for url in [
+            "https://archive.org/download/some-item/file.zip",
+            "https://ia601504.us.archive.org/some-item/file.zip",
+        ] {
+            let header = jar
+                .cookies(&reqwest::Url::parse(url).unwrap())
+                .unwrap_or_else(|| panic!("cookies should be sent to {url}"));
+            let header = header.to_str().unwrap();
+            assert!(
+                header.contains("logged-in-user=user%40example.com"),
+                "{url}"
+            );
+            assert!(header.contains("logged-in-sig=s1gn4tur3"), "{url}");
+        }
+    }
+
+    #[test]
+    fn parse_login_session_rejects_payload_without_cookies() {
+        let payload: XAuthnResponse = serde_json::from_str(
+            r#"{"success":true,"values":{"screenname":"someuser"},"version":1}"#,
+        )
+        .expect("Payload should parse");
+
+        let error = parse_login_session(&payload).expect_err("Missing cookies should fail");
+        assert!(error.to_string().contains("missing session cookies"));
+    }
 }
