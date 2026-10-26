@@ -1,0 +1,37 @@
+{
+  "comment": "Overrides for scripts/rust-notices.py: crates linked into the ia-get release binaries that publish no license text, and musl libc, which the musl target links from the Rust toolchain. rust/ holds verbatim upstream files; each reason names its source.",
+  "crates": [
+    {
+      "name": "objc2",
+      "files": ["rust/objc2-LICENSE-MIT.txt"],
+      "reason": "macOS only. Publishes no license file; MIT per Cargo.toml and LICENSE.md in github.com/madsmtm/objc2. Upstream added the MIT text for every crate in the repository as LICENSE-MIT.txt (commit ee9a7ada2131, 2026-03-18); that file is copied verbatim"
+    },
+    {
+      "name": "objc2-encode",
+      "files": ["rust/objc2-LICENSE-MIT.txt"],
+      "reason": "macOS only. Same repository and terms as objc2 (MIT-only per LICENSE.md); same text"
+    },
+    {
+      "name": "block2",
+      "files": ["rust/objc2-LICENSE-MIT.txt"],
+      "reason": "macOS only. Same repository and terms as objc2 (MIT-only per LICENSE.md); same text"
+    },
+    {
+      "name": "dispatch2",
+      "files": ["rust/objc2-LICENSE-MIT.txt"],
+      "reason": "macOS only. Same repository as objc2; 'Zlib OR Apache-2.0 OR MIT' per Cargo.toml and LICENSE.md, MIT chosen; same text"
+    }
+  ],
+  "extra": [
+    {
+      "name": "musl libc",
+      "version": "1.2.5",
+      "license": "MIT",
+      "targets": ["*-linux-musl*"],
+      "files": ["rust/musl-1.2.5-COPYRIGHT.txt"],
+      "repository": "https://git.musl-libc.org/cgit/musl",
+      "source_url": "https://musl.libc.org/releases/musl-1.2.5.tar.gz",
+      "reason": "The x86_64-unknown-linux-musl binary statically links the Rust toolchain's self-contained musl. rustc 1.99.0 builds musl 1.2.5 (src/ci/docker/scripts/musl.sh at tag 1.99.0); COPYRIGHT copied verbatim from musl at tag v1.2.5 (sha256 f9bc4423732350eb0b3f7ed7e91d530298476f8fec0c6c427a1c04ade22655af). Check musl.sh when the stable toolchain changes"
+    }
+  ]
+}

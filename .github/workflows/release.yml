@@ -81,6 +81,15 @@ jobs:
           OS_NAME: ${{ matrix.job.os }}
         run: ./.github/workflows/before_deploy.sh
 
+      # The archive and the .deb must carry the third-party notices before
+      # upload. ci.yml runs the same check.
+      - name: Verify license notices
+        shell: bash
+        env:
+          TARGET: ${{ matrix.job.target }}
+          OS_NAME: ${{ matrix.job.os }}
+        run: ./.github/workflows/verify_notices.sh
+
       - name: Releasing assets
         uses: softprops/action-gh-release@v2
         if: github.ref_type == 'tag'

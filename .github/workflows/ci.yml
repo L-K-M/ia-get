@@ -15,6 +15,9 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
+      # The crate's license field must match the root LICENSE (MIT).
+      - name: Check license statement
+        run: grep -qx 'license = "MIT"' Cargo.toml
       - name: Installing Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -25,5 +28,30 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Run tests
         run: cargo test
+      # Every release target's linked crates need license texts; gaps go in
+      # licenses/rust-overrides.json.
+      - name: Check Rust license notices
+        run: |
+          for target in x86_64-apple-darwin aarch64-apple-darwin x86_64-pc-windows-msvc \
+              x86_64-unknown-linux-gnu x86_64-unknown-linux-musl i686-unknown-linux-gnu \
+              arm-unknown-linux-gnueabihf aarch64-unknown-linux-gnu; do
+            python3 scripts/rust-notices.py --target "$target" \
+              --overrides licenses/rust-overrides.json --own-license MIT --check
+          done
       - name: Build release
-        run: cargo build --release
+        run: cargo build --release --target x86_64-unknown-linux-gnu
+      # Package the Linux archive and .deb as release.yml does, with a dummy
+      # version, so the notices check below sees the real artifacts.
+      - name: Package release artifacts
+        env:
+          TARGET: x86_64-unknown-linux-gnu
+          PROJECT_NAME: ia-get
+          PACKAGE_NAME: ia-get
+          OS_NAME: ubuntu-latest
+        run: GITHUB_REF=refs/tags/0.0.0 ./.github/workflows/before_deploy.sh
+      # Same check as in release.yml (verify_notices.sh).
+      - name: Verify license notices
+        env:
+          TARGET: x86_64-unknown-linux-gnu
+          OS_NAME: ubuntu-latest
+        run: ./.github/workflows/verify_notices.sh
