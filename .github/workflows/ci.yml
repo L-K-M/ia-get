@@ -15,6 +15,9 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
+      # The crate's license field must match the root LICENSE (MIT).
+      - name: Check license statement
+        run: grep -qx 'license = "MIT"' Cargo.toml
       - name: Installing Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
