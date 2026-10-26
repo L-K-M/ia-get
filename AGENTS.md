@@ -49,6 +49,12 @@ src/
 - Update `Cargo.lock` when adding dependencies
 - TLS via `rustls` only (no openssl)
 
+## Licensing
+
+- ia-get's own code is MIT (`LICENSE`). Keep `Cargo.toml`, the .deb copyright file in `.github/workflows/before_deploy.sh` and the README consistent with it; CI checks the `Cargo.toml` field.
+- Before adding a dependency, vendored file or bundled asset, confirm its license allows redistribution in the release binaries. Never vendor third-party code without its license file.
+- `scripts/rust-notices.py` builds `Third-Party-Notices.txt` from the crates linked into each release target and fails on a crate without license text; record gaps as explicit overrides in `licenses/rust-overrides.json`. `before_deploy.sh` ships it with `Rust-Licenses.html` in every archive and .deb; keep the CI and release notice checks passing.
+
 ## Platform Support
 
 Must build on: `x86_64-linux`, `aarch64-linux`, `x86_64-darwin`, `aarch64-darwin`
