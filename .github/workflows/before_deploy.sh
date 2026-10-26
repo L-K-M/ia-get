@@ -3,6 +3,23 @@
 
 set -ex
 
+# Write the notices of the crates statically linked into $TARGET's binary
+# and of the Rust standard library into $1. rust-notices.py fails when a
+# crate has no license text; gaps go in licenses/rust-overrides.json.
+notices() {
+    local python=python3
+
+    # Windows runners have python but no python3
+    if [ "$OS_NAME" = windows-latest ]; then
+        python=python
+    fi
+    "$python" scripts/rust-notices.py --target "$TARGET" --title "$PROJECT_NAME" \
+        --overrides licenses/rust-overrides.json --own-license MIT \
+        --out "$1/Third-Party-Notices.txt" --rust-std "$1/Rust-Licenses.html"
+    test -s "$1/Third-Party-Notices.txt"
+    test -s "$1/Rust-Licenses.html"
+}
+
 pack() {
     local tempdir
     local out_dir
@@ -30,9 +47,10 @@ pack() {
         "${gcc_prefix}"strip "$tempdir/$package_name/$PROJECT_NAME"
     fi
 
-    # manpage, readme and license
+    # readme, license and third-party notices
     cp README.md "$tempdir/$package_name"
     cp LICENSE "$tempdir/$package_name"
+    cp "$notices_dir/Third-Party-Notices.txt" "$notices_dir/Rust-Licenses.html" "$tempdir/$package_name"
 
     # archiving
     pushd "$tempdir"
@@ -108,16 +126,37 @@ make_deb() {
     depends="$(dpkg-shlibdeps $library_dir -O "$tempdir/usr/bin/$PROJECT_NAME" 2> /dev/null | sed 's/^shlibs:Depends=//')"
     rm -rf "./debian"
 
-    # readme and license
+    # readme, license and third-party notices
     install -Dm644 README.md "$tempdir/usr/share/doc/$dpkgname/README.md"
+    install -Dm644 "$notices_dir/Third-Party-Notices.txt" "$tempdir/usr/share/doc/$dpkgname/Third-Party-Notices.txt"
+    install -Dm644 "$notices_dir/Rust-Licenses.html" "$tempdir/usr/share/doc/$dpkgname/Rust-Licenses.html"
+    # The binary paragraph keeps "Files: *" from claiming the statically
+    # linked crates and Rust standard library are MIT.
     cat > "$tempdir/usr/share/doc/$dpkgname/copyright" <<EOF
 Format: http://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: $PROJECT_NAME
 Source: $homepage
+Comment: usr/bin/$PROJECT_NAME statically links Rust crates and the Rust
+ standard library, which keep their own licenses. Their license texts and
+ notices are in Third-Party-Notices.txt and Rust-Licenses.html, next to
+ this file.
 
 Files: *
 Copyright: $copyright_years $maintainer
 License: MIT
+
+Files: usr/bin/$PROJECT_NAME
+Copyright: $copyright_years $maintainer
+ The authors of each Rust crate, as listed in Third-Party-Notices.txt
+ The Rust Project Developers and the authors listed in Rust-Licenses.html
+License: MIT and LicenseRef-Bundled-Rust
+Comment: Besides ia-get's own code (MIT), the binary contains the Rust
+ crates listed in Third-Party-Notices.txt (MIT, Apache-2.0, ISC,
+ BSD-3-Clause, Unicode-3.0, CDLA-Permissive-2.0, MPL-2.0 and others) and
+ the Rust standard library (Rust-Licenses.html). In the $PACKAGE_NAME-musl
+ package it also contains musl libc (MIT), listed in Third-Party-Notices.txt.
+ MPL-2.0 crates such as colored are used unmodified; Third-Party-Notices.txt
+ gives the location of their Source Code Form.
 
 License: MIT
  Permission is hereby granted, free of charge, to any
@@ -143,6 +182,11 @@ License: MIT
  OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
  IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
  DEALINGS IN THE SOFTWARE.
+
+License: LicenseRef-Bundled-Rust
+ Each statically linked component keeps its own license. Their full
+ license texts, copyright notices and source links are in
+ Third-Party-Notices.txt and Rust-Licenses.html, next to this file.
 EOF
     chmod 644 "$tempdir/usr/share/doc/$dpkgname/copyright"
 
@@ -168,10 +212,15 @@ EOF
 
 
 main() {
+    # generated once, shipped in the archive and the .deb
+    notices_dir=$(mktemp -d 2>/dev/null || mktemp -d -t tmp)
+    notices "$notices_dir"
+
     pack
     if [[ $TARGET = *linux* ]]; then
       make_deb
     fi
+    rm -r "$notices_dir"
 }
 
 main

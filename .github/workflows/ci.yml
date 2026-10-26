@@ -28,5 +28,15 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Run tests
         run: cargo test
+      # Every release target's linked crates need license texts; gaps go in
+      # licenses/rust-overrides.json.
+      - name: Check Rust license notices
+        run: |
+          for target in x86_64-apple-darwin aarch64-apple-darwin x86_64-pc-windows-msvc \
+              x86_64-unknown-linux-gnu x86_64-unknown-linux-musl i686-unknown-linux-gnu \
+              arm-unknown-linux-gnueabihf aarch64-unknown-linux-gnu; do
+            python3 scripts/rust-notices.py --target "$target" \
+              --overrides licenses/rust-overrides.json --own-license MIT --check
+          done
       - name: Build release
         run: cargo build --release
