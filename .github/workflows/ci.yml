@@ -39,4 +39,47 @@ jobs:
               --overrides licenses/rust-overrides.json --own-license MIT --check
           done
       - name: Build release
-        run: cargo build --release
+        run: cargo build --release --target x86_64-unknown-linux-gnu
+      # Package the Linux archive and .deb as release.yml does, with a dummy
+      # version, so the notices check below sees the real artifacts.
+      - name: Package release artifacts
+        env:
+          TARGET: x86_64-unknown-linux-gnu
+          PROJECT_NAME: ia-get
+          PACKAGE_NAME: ia-get
+          OS_NAME: ubuntu-latest
+        run: GITHUB_REF=refs/tags/0.0.0 ./.github/workflows/before_deploy.sh
+      # Same check as in release.yml.
+      - name: Verify license notices
+        env:
+          TARGET: x86_64-unknown-linux-gnu
+          OS_NAME: ubuntu-latest
+        run: |
+          check() {
+            test -s "$1/Third-Party-Notices.txt"
+            test -s "$1/Rust-Licenses.html"
+            grep -q '^tokio ' "$1/Third-Party-Notices.txt"
+            grep -q '^colored ' "$1/Third-Party-Notices.txt"
+            grep -q 'Copyright notices for The Rust Standard Library' "$1/Rust-Licenses.html"
+            if [[ $TARGET == *musl* ]]; then
+              grep -q '^musl libc ' "$1/Third-Party-Notices.txt"
+            fi
+          }
+          mkdir notices-check
+          if [ "$OS_NAME" = windows-latest ]; then
+            7z x -onotices-check ia-get-*-"$TARGET".zip
+          else
+            tar -xzf ia-get-*-"$TARGET".tar.gz -C notices-check
+          fi
+          for dir in notices-check/ia-get-*-"$TARGET"; do
+            grep -q 'Permission is hereby granted' "$dir/LICENSE"
+            check "$dir"
+          done
+          if [[ $TARGET == *linux* ]]; then
+            for deb in ia-get*.deb; do
+              pkg=$(dpkg-deb -f "$deb" Package)
+              dpkg-deb -x "$deb" "notices-check/$pkg"
+              grep -q '^License: LicenseRef-Bundled-Rust' "notices-check/$pkg/usr/share/doc/$pkg/copyright"
+              check "notices-check/$pkg/usr/share/doc/$pkg"
+            done
+          fi
