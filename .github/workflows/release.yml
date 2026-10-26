@@ -82,41 +82,13 @@ jobs:
         run: ./.github/workflows/before_deploy.sh
 
       # The archive and the .deb must carry the third-party notices before
-      # upload. Same check as in ci.yml.
+      # upload. ci.yml runs the same check.
       - name: Verify license notices
         shell: bash
         env:
           TARGET: ${{ matrix.job.target }}
           OS_NAME: ${{ matrix.job.os }}
-        run: |
-          check() {
-            test -s "$1/Third-Party-Notices.txt"
-            test -s "$1/Rust-Licenses.html"
-            grep -q '^tokio ' "$1/Third-Party-Notices.txt"
-            grep -q '^colored ' "$1/Third-Party-Notices.txt"
-            grep -q 'Copyright notices for The Rust Standard Library' "$1/Rust-Licenses.html"
-            if [[ $TARGET == *musl* ]]; then
-              grep -q '^musl libc ' "$1/Third-Party-Notices.txt"
-            fi
-          }
-          mkdir notices-check
-          if [ "$OS_NAME" = windows-latest ]; then
-            7z x -onotices-check ia-get-*-"$TARGET".zip
-          else
-            tar -xzf ia-get-*-"$TARGET".tar.gz -C notices-check
-          fi
-          for dir in notices-check/ia-get-*-"$TARGET"; do
-            grep -q 'Permission is hereby granted' "$dir/LICENSE"
-            check "$dir"
-          done
-          if [[ $TARGET == *linux* ]]; then
-            for deb in ia-get*.deb; do
-              pkg=$(dpkg-deb -f "$deb" Package)
-              dpkg-deb -x "$deb" "notices-check/$pkg"
-              grep -q '^License: LicenseRef-Bundled-Rust' "notices-check/$pkg/usr/share/doc/$pkg/copyright"
-              check "notices-check/$pkg/usr/share/doc/$pkg"
-            done
-          fi
+        run: ./.github/workflows/verify_notices.sh
 
       - name: Releasing assets
         uses: softprops/action-gh-release@v2

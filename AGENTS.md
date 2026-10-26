@@ -53,7 +53,7 @@ src/
 
 - ia-get's own code is MIT (`LICENSE`). Keep `Cargo.toml`, the .deb copyright file in `.github/workflows/before_deploy.sh` and the README consistent with it; CI checks the `Cargo.toml` field.
 - Before adding a dependency, vendored file or bundled asset, confirm its license allows redistribution in the release binaries. Never vendor third-party code without its license file.
-- `scripts/rust-notices.py` builds `Third-Party-Notices.txt` from the crates linked into each release target and fails on a crate without license text; record gaps as explicit overrides in `licenses/rust-overrides.json`. `before_deploy.sh` ships it with `Rust-Licenses.html` in every archive and .deb; keep the CI and release notice checks passing.
+- `scripts/rust-notices.py` builds `Third-Party-Notices.txt` from the crates linked into each release target and fails on a crate without license text; record gaps as explicit overrides in `licenses/rust-overrides.json`. `before_deploy.sh` ships it with `Rust-Licenses.html` in every archive and .deb, and `verify_notices.sh` checks the packages in CI and before release upload; keep both passing. When stable rustc moves to a new musl, the musl release check fails until the musl entry in `licenses/rust-overrides.json` and its text in `licenses/rust/` are updated.
 
 ## Platform Support
 
