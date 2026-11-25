@@ -63,7 +63,8 @@ jobs:
         with:
           ZAI_API_KEY: ${{ env.ZAI_API_KEY }}
           # StepFun reviews routine chunks and rate-limited deep chunks.
-          # GLM remains the deep reviewer and fast-tier backstop.
+          # GLM remains the deep reviewer and fast-tier backstop. If the
+          # STEPFUN_API_KEY secret is empty, the fast tier uses Z.ai instead.
           FAST_API_KEY: ${{ secrets.STEPFUN_API_KEY }}
           FAST_API_URL: https://api.stepfun.ai/step_plan/v1/chat/completions
           FAST_MODEL: step-5-preview
